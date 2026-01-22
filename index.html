@@ -1,0 +1,1536 @@
+daysite
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>送迎配車システム</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: 'Helvetica Neue', Arial, 'Hiragino Kaku Gothic ProN', 'Hiragino Sans', Meiryo, sans-serif;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        html,
+        body {
+            overscroll-behavior-y: none;
+            touch-action: pan-x pan-y;
+        }
+
+        body {
+            font-family: 'Helvetica Neue', Arial, 'Hiragino Kaku Gothic ProN', 'Hiragino Sans', Meiryo, sans-serif;
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+        }
+
+        input,
+        textarea,
+        select {
+            user-select: text;
+        }
+
+        .no-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+
+        @media print {
+            .page-break-inside-avoid {
+                page-break-inside: avoid;
+            }
+        }
+    </style>
+    <link rel="manifest" href="manifest.json">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="送迎配車">
+</head>
+
+<body class="bg-slate-50 text-slate-900">
+    <div id="root"></div>
+
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./service-worker.js')
+                    .then(registration => {
+                        console.log('SW registered: ', registration);
+                    })
+                    .catch(registrationError => {
+                        console.log('SW registration failed: ', registrationError);
+                    });
+            });
+        }
+    </script>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+        const FIXED_GAS_URL = "https://script.google.com/macros/s/AKfycbxx2rOYHP1QZz3g-Ys33tNB2A3p-y4qgZnS9EDhjyT-nbf8R6WIBsqeroLsgDLEIp3AiQ/exec";
+        const WEEK_DAYS = ['月', '火', '水', '木', '金', '土', '日'];
+
+        // 初期車両データ（クラウドからデータを読み込むため空）
+        const INITIAL_VEHICLES = [];
+
+        const getTodayDateString = () => {
+            const d = new Date();
+            const year = d.getFullYear();
+            const month = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        };
+        const getDayOfWeek = (dateStr) => {
+            const date = new Date(dateStr);
+            return WEEK_DAYS[date.getDay() === 0 ? 6 : date.getDay() - 1]; // Mon=0 .. Sun=6 conversion for array index? No, Date.getDay() 0=Sun. 
+            // WEEK_DAYS is ['月', '火', '水', '木', '金', '土', '日']
+            // 0=Sun -> index 6 ("日")
+            // 1=Mon -> index 0 ("月")
+        };
+
+        const getDayLabel = (dateStr) => {
+            const dayMap = ['日', '月', '火', '水', '木', '金', '土'];
+            return dayMap[new Date(dateStr).getDay()];
+        };
+
+        const App = () => {
+            // Mobile Detection
+            const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+
+            useEffect(() => {
+                const handleResize = () => setIsMobile(window.innerWidth < 768);
+                window.addEventListener('resize', handleResize);
+                return () => window.removeEventListener('resize', handleResize);
+            }, []);
+
+            // Initial Tab: If mobile, start with 'record'
+            useEffect(() => {
+                if (window.innerWidth < 768) {
+                    setActiveTab('record');
+                }
+            }, []);
+
+            const [activeTab, setActiveTab] = useState(window.innerWidth < 768 ? 'record' : 'schedule');
+            const [currentDate, setCurrentDate] = useState(getTodayDateString());
+            const [isSyncing, setIsSyncing] = useState(false);
+            const [statusMessage, setStatusMessage] = useState("");
+            const [csvInput, setCsvInput] = useState("");
+
+            const [users, setUsers] = useState([]);
+            const [vehicles, setVehicles] = useState(INITIAL_VEHICLES);
+            const [staff, setStaff] = useState([]);
+            const [newStaffName, setNewStaffName] = useState("");
+
+            // History: { "2025-01-01": [ { vehicleId:..., assignedUsers:..., driverId:..., assistantId:... } ] }
+            const [allocationHistory, setAllocationHistory] = useState({});
+            // Legacy support (optional, can be merged into history or kept as fallback templates)
+            const [weeklyAllocations, setWeeklyAllocations] = useState(() => {
+                const initial = {};
+                WEEK_DAYS.forEach(day => initial[day] = []);
+                return initial;
+            });
+
+            const syncCloud = useCallback(async (action) => {
+                setIsSyncing(true);
+                setStatusMessage(`通信中...`);
+                try {
+                    const targetUrl = `${FIXED_GAS_URL}?action=${action}&_=${new Date().getTime()}`;
+
+                    if (action === 'save') {
+                        // Safe Save: 1. Load latest 2. Merge local into latest 3. Save
+                        const loadResponse = await fetch(`${targetUrl.replace('action=save', 'action=load')}`, { redirect: 'follow' });
+                        const latestCloudData = await loadResponse.json();
+
+                        // MERGE LOGIC
+                        const mergedData = { ...latestCloudData };
+
+                        // 1. Merge Users/Vehicles/Staff (Prioritize Local changes if any? Or just overwrite?)
+                        // Ideally: mergedData.users = latestCloudData.users.map(...)
+                        // For simplicity and preventing overwrite of Admin changes, we assume Local is valid context.
+                        // But for "Record Input", we primarily want to update "Allocation History".
+
+                        // We will PUSH local users/vehicles/staff. 
+                        mergedData.users = users;
+                        mergedData.vehicles = vehicles;
+                        mergedData.staff = staff;
+                        mergedData.allocations = weeklyAllocations;
+
+                        // AllocationHistory Merge
+                        if (!mergedData.history) mergedData.history = {};
+
+                        // Merge Local History into Cloud History
+                        Object.keys(allocationHistory).forEach(date => {
+                            const localDayAllocs = allocationHistory[date];
+                            const cloudDayAllocs = mergedData.history[date] || [];
+
+                            // For this day, merge vehicles.
+                            const cloudMap = {};
+                            cloudDayAllocs.forEach(a => {
+                                const key = `${a.vehicleId}-${a.tripNumber || 1}`;
+                                cloudMap[key] = a;
+                            });
+
+                            // Overlay local allocations
+                            localDayAllocs.forEach(localA => {
+                                const key = `${localA.vehicleId}-${localA.tripNumber || 1}`;
+                                cloudMap[key] = localA;
+                            });
+
+                            mergedData.history[date] = Object.values(cloudMap);
+                        });
+
+                        await fetch(targetUrl, {
+                            method: 'POST',
+                            body: JSON.stringify(mergedData),
+                            headers: { 'Content-Type': 'text/plain;charset=utf-8' }
+                        });
+                        setStatusMessage("保存完了 (統合済)");
+
+                        // Sync local state
+                        if (mergedData.users) setUsers(mergedData.users);
+                        if (mergedData.history) setAllocationHistory(mergedData.history);
+
+                    } else {
+                        const response = await fetch(targetUrl, { method: 'GET', redirect: 'follow' });
+                        const data = await response.json();
+                        if (data.users) setUsers(data.users);
+                        if (data.vehicles) setVehicles(data.vehicles);
+                        if (data.allocations) setWeeklyAllocations(data.allocations);
+                        if (data.staff) setStaff(data.staff);
+                        if (data.history) setAllocationHistory(data.history);
+                        setStatusMessage(`読込完了`);
+                    }
+                } catch (e) {
+                    setStatusMessage(`エラー: ${e.message}`);
+                } finally {
+                    setIsSyncing(false);
+                    setTimeout(() => setStatusMessage(""), 3000);
+                }
+            }, [users, vehicles, weeklyAllocations, staff, allocationHistory]);
+
+            useEffect(() => {
+                // Initialize from LocalStorage
+                const saved = localStorage.getItem('daysite_local_data');
+                if (saved) {
+                    try {
+                        const parsed = JSON.parse(saved);
+                        if (parsed.users) setUsers(parsed.users);
+                        if (parsed.vehicles) setVehicles(parsed.vehicles);
+                        if (parsed.staff) setStaff(parsed.staff);
+                        if (parsed.allocations) setWeeklyAllocations(parsed.allocations);
+                        if (parsed.history) setAllocationHistory(parsed.history);
+                        setStatusMessage("ローカル読込完了");
+                    } catch (e) {
+                        console.error('Failed to load local data', e);
+                    }
+                }
+            }, []);
+
+            // Auto-save to LocalStorage
+            useEffect(() => {
+                const data = {
+                    users,
+                    vehicles,
+                    staff,
+                    allocations: weeklyAllocations,
+                    history: allocationHistory,
+                    updatedAt: new Date().toISOString()
+                };
+                localStorage.setItem('daysite_local_data', JSON.stringify(data));
+            }, [users, vehicles, staff, weeklyAllocations, allocationHistory]);
+
+            // 強化版インポートロジック
+            const importData = () => {
+                if (!csvInput.trim()) return;
+
+                // 改行で分割し、カンマまたはタブで分割
+                const lines = csvInput.split(/\r?\n/).filter(line => line.trim());
+                const rows = lines.map(line => {
+                    if (line.includes('\t')) return line.split('\t').map(s => s.trim());
+                    return line.split(',').map(s => s.trim().replace(/^"|"$/g, ''));
+                });
+
+                if (rows.length < 2) {
+                    setStatusMessage("データ形式が正しくありません");
+                    return;
+                }
+
+                // 1. 曜日ごとの「利用者名」列のインデックスを探す
+                const headerRow = rows[0];
+                const dayToColIdx = {};
+
+                headerRow.forEach((cell, idx) => {
+                    WEEK_DAYS.forEach(day => {
+                        if (cell.includes(`(${day})`)) {
+                            let nameIdx = idx + 2;
+                            if (rows[1] && rows[1][idx + 1] === '利用者名') nameIdx = idx + 1;
+                            if (rows[1] && rows[1][idx + 2] === '利用者名') nameIdx = idx + 2;
+                            dayToColIdx[day] = nameIdx;
+                        }
+                    });
+                });
+
+                if (Object.keys(dayToColIdx).length === 0) {
+                    setStatusMessage("日付（月〜日）が見つかりませんでした");
+                    return;
+                }
+
+                const userMap = {};
+
+                rows.forEach((row, rowIdx) => {
+                    if (rowIdx < 2) return;
+
+                    Object.entries(dayToColIdx).forEach(([day, colIdx]) => {
+                        const cell = row[colIdx];
+                        if (cell && cell.includes('(') && cell.includes(')')) {
+                            const match = cell.match(/\((\d+)\)\s*(.+)/);
+                            if (match) {
+                                const id = match[1];
+                                const name = match[2].trim();
+                                if (!userMap[id]) {
+                                    userMap[id] = { id, name, schedule: [] };
+                                }
+                                if (!userMap[id].schedule.includes(day)) {
+                                    userMap[id].schedule.push(day);
+                                }
+                            }
+                        }
+                    });
+                });
+
+                const importedUsers = Object.values(userMap).map(u => ({
+                    ...u,
+                    schedule: u.schedule.join(','),
+                    care_level: '一般'
+                }));
+
+                if (importedUsers.length > 0) {
+                    setUsers(importedUsers);
+                    // 初期配車枠の作成（Legacy）
+                    setWeeklyAllocations(prev => {
+                        const next = { ...prev };
+                        WEEK_DAYS.forEach(day => {
+                            if (!next[day] || next[day].length === 0) {
+                                next[day] = vehicles.map(v => ({
+                                    vehicleId: v.id,
+                                    assignedUsers: [],
+                                    driverId: '',
+                                    assistantId: ''
+                                }));
+                            }
+                        });
+                        return next;
+                    });
+                    setCsvInput("");
+                    setStatusMessage(`${importedUsers.length}名のデータを取り込みました`);
+                    setActiveTab('schedule');
+                } else {
+                    setStatusMessage("有効な(ID)付きの利用者名が見つかりませんでした");
+                }
+            };
+
+            // Date logic
+            const currentDayOfWeek = useMemo(() => getDayLabel(currentDate), [currentDate]);
+
+            // Helper to get allocations for ANY date
+            const getAllocationsForDate = useCallback((targetDate) => {
+                const targetDayOfWeek = getDayLabel(targetDate);
+                let baseAllocations = [];
+
+                // 1. Exact match
+                if (allocationHistory[targetDate]) {
+                    baseAllocations = allocationHistory[targetDate];
+                }
+                // 2. 7 Days ago (One week carry-over)
+                else {
+                    const prevDate = new Date(targetDate);
+                    prevDate.setDate(prevDate.getDate() - 7);
+                    const prevDateString = prevDate.toISOString().split('T')[0];
+                    if (allocationHistory[prevDateString]) {
+                        baseAllocations = JSON.parse(JSON.stringify(allocationHistory[prevDateString]));
+                    }
+                    // 3. Weekly Template Fallback
+                    else if (weeklyAllocations[targetDayOfWeek] && weeklyAllocations[targetDayOfWeek].length > 0) {
+                        baseAllocations = JSON.parse(JSON.stringify(weeklyAllocations[targetDayOfWeek]));
+                    }
+                }
+
+                // MERGE: Ensure all current vehicles exist
+                let finalAllocations = [];
+
+                vehicles.forEach(v => {
+                    // Find all allocations for this vehicle
+                    const existingForVehicle = baseAllocations.filter(a => a.vehicleId === v.id);
+
+                    if (existingForVehicle.length > 0) {
+                        // Ensure they have tripNumber (migration for old data)
+                        existingForVehicle.forEach(a => {
+                            if (!a.tripNumber) a.tripNumber = 1;
+                            if (!a.assignedUsersDropoff) a.assignedUsersDropoff = [];
+
+                            // Migrate Legacy Staff to Split Staff if missing
+                            if (a.pickupDriverId === undefined) a.pickupDriverId = a.driverId || '';
+                            if (a.pickupAssistantId === undefined) a.pickupAssistantId = a.assistantId || '';
+                            if (a.dropoffDriverId === undefined) a.dropoffDriverId = a.driverId || '';
+                            if (a.dropoffAssistantId === undefined) a.dropoffAssistantId = a.assistantId || '';
+                        });
+                        // Sort by tripNumber
+                        existingForVehicle.sort((a, b) => a.tripNumber - b.tripNumber);
+                        finalAllocations = [...finalAllocations, ...existingForVehicle];
+                    } else {
+                        // Create default Trip 1
+                        finalAllocations.push({
+                            vehicleId: v.id,
+                            tripNumber: 1,
+                            assignedUsers: [],
+                            assignedUsersDropoff: [],
+                            pickupDriverId: '',
+                            pickupAssistantId: '',
+                            dropoffDriverId: '',
+                            dropoffAssistantId: '',
+                            driverId: '', // Legacy
+                            assistantId: '' // Legacy
+                        });
+                    }
+                });
+
+                return finalAllocations;
+            }, [allocationHistory, weeklyAllocations, vehicles]);
+
+            // Get allocations for view: Today > 7 days ago > Weekly Template > Empty
+            const currentAllocations = useMemo(() => {
+                return getAllocationsForDate(currentDate);
+            }, [getAllocationsForDate, currentDate]);
+
+            // Allocations specifically for "Today" (for Record Input)
+            const todayDateString = getTodayDateString();
+            const todayAllocations = useMemo(() => {
+                return getAllocationsForDate(todayDateString);
+            }, [getAllocationsForDate, todayDateString]);
+
+
+            const [showAllUsers, setShowAllUsers] = useState(false);
+            const [searchQuery, setSearchQuery] = useState("");
+            const [selectedKanaRow, setSelectedKanaRow] = useState(null);
+
+            const KANA_ROWS = [
+                { label: 'あ', chars: ['あ', 'い', 'う', 'え', 'お', 'ア', 'イ', 'ウ', 'エ', 'オ'] },
+                { label: 'か', chars: ['か', 'き', 'く', 'け', 'こ', 'カ', 'キ', 'ク', 'ケ', 'コ', 'が', 'ぎ', 'ぐ', 'げ', 'ご', 'ガ', 'ギ', 'グ', 'ゲ', 'ゴ'] },
+                { label: 'さ', chars: ['さ', 'し', 'す', 'せ', 'そ', 'サ', 'シ', 'ス', 'セ', 'ソ', 'ざ', 'じ', 'ず', 'ぜ', 'ぞ', 'ザ', 'ジ', 'ズ', 'ゼ', 'ゾ'] },
+                { label: 'た', chars: ['た', 'ち', 'つ', 'て', 'と', 'タ', 'チ', 'ツ', 'テ', 'ト', 'だ', 'ぢ', 'づ', 'で', 'ど', 'ダ', 'ヂ', 'ヅ', 'デ', 'ド'] },
+                { label: 'な', chars: ['な', 'に', 'ぬ', 'ね', 'の', 'ナ', 'ニ', 'ヌ', 'ネ', 'ノ'] },
+                { label: 'は', chars: ['は', 'ひ', 'ふ', 'へ', 'ほ', 'ハ', 'ヒ', 'フ', 'ヘ', 'ホ', 'ば', 'び', 'ぶ', 'べ', 'ぼ', 'バ', 'ビ', 'ブ', 'ベ', 'ボ', 'ぱ', 'ぴ', 'ぷ', 'ぺ', 'ぽ', 'パ', 'ピ', 'プ', 'ペ', 'ポ'] },
+                { label: 'ま', chars: ['ま', 'み', 'む', 'め', 'も', 'マ', 'ミ', 'ム', 'メ', 'モ'] },
+                { label: 'や', chars: ['や', 'ゆ', 'よ', 'ヤ', 'ユ', 'ヨ'] },
+                { label: 'ら', chars: ['ら', 'り', 'る', 'れ', 'ろ', 'ラ', 'リ', 'ル', 'レ', 'ロ'] },
+                { label: 'わ', chars: ['わ', 'を', 'ん', 'ワ', 'ヲ', 'ン'] },
+            ];
+
+            const displayedUnallocatedUsers = useMemo(() => {
+                // 1. Base List: All unallocated users OR All users (excluding currently assigned)
+                const allocatedIds = currentAllocations.flatMap(a => a.assignedUsers.map(au => au.userId));
+
+                let candidates = [];
+                if (showAllUsers) {
+                    candidates = users.filter(u => !allocatedIds.includes(u.id));
+                } else {
+                    // Only today's scheduled users
+                    candidates = users.filter(u => u.schedule.includes(currentDayOfWeek) && !allocatedIds.includes(u.id));
+                }
+
+                // 2. Filter by Search Query
+                if (searchQuery.trim()) {
+                    const q = searchQuery.trim().toLowerCase();
+                    candidates = candidates.filter(u => u.name.toLowerCase().includes(q));
+                }
+
+                // 3. Filter by Kana Row
+                if (selectedKanaRow) {
+                    const targetChars = KANA_ROWS.find(r => r.label === selectedKanaRow)?.chars || [];
+                    candidates = candidates.filter(u => {
+                        const firstChar = u.name.charAt(0);
+                        return targetChars.includes(firstChar);
+                    });
+                }
+
+                return candidates;
+            }, [users, currentAllocations, showAllUsers, searchQuery, selectedKanaRow, currentDayOfWeek]);
+
+            const toggleAllocation = (userId, targetVehicleId, targetTripNumber = 1, targetType = 'assignedUsers') => {
+                setAllocationHistory(prev => {
+                    const currentList = currentAllocations;
+                    const newList = JSON.parse(JSON.stringify(currentList));
+
+                    // Remove from all vehicles/trips in this day (Single allocation enforcement)
+                    // ... WAIT: User can be in Pickup AND Dropoff.
+                    // If targetType is 'assignedUsers', remove from other 'assignedUsers' lists.
+                    // If targetType is 'assignedUsersDropoff', remove from other 'assignedUsersDropoff' lists.
+
+                    newList.forEach(alloc => {
+                        if (alloc[targetType]) {
+                            alloc[targetType] = alloc[targetType].filter(au => au.userId !== userId);
+                        }
+                    });
+
+                    // Add to target
+                    if (targetVehicleId) {
+                        const alloc = newList.find(a => a.vehicleId === targetVehicleId && (a.tripNumber || 1) === targetTripNumber);
+                        if (alloc) {
+                            if (!alloc[targetType]) alloc[targetType] = [];
+                            alloc[targetType].push({ userId, temperature: '', remarks: '' });
+                        }
+                    }
+
+                    return { ...prev, [currentDate]: newList };
+                });
+            };
+
+            // Add new Trip (Unlimited)
+            const addTrip = (vehicleId) => {
+                setAllocationHistory(prev => {
+                    const currentList = prev[currentDate] || [];
+
+                    // We need to base this on what is currently displayed/calculated for today
+                    // because displayedAllocations merges templates + history.
+                    // If we add a trip, we must save the current state + new trip to history.
+
+                    const displayedForVehicle = displayedAllocations.filter(a => a.vehicleId === vehicleId);
+                    const maxTrip = displayedForVehicle.reduce((max, a) => Math.max(max, a.tripNumber || 1), 0);
+                    const nextTrip = maxTrip + 1;
+
+                    // Prepare new history list
+                    // Use existing history OR if empty, we might be starting fresh for today.
+                    // Ideally, we take all 'displayedAllocations' for today (which includes valid state) and save THAT as history?
+                    // Yes, acts as a "Save current view + modification".
+                    // But 'displayedAllocations' is only for 'vehicleFilter'? No, usually all.
+                    // Wait, displayedAllocations might be filtered by 'vehicleFilter'.
+                    // We should use 'currentAllocations' (which is the full Unfiltered view of today).
+
+                    let newList = (prev[currentDate] ? [...prev[currentDate]] : []);
+
+                    // If 'prev[currentDate]' is missing elements that are in 'currentAllocations' (e.g. from Template),
+                    // we should ensure we don't lose them if we touch the day.
+                    // Actually, 'updateUserStatus' modifies 'currentAllocations' logic?
+                    // No, 'updateUserStatus' relies on 'prev[dateKey]'.
+                    // If 'prev[dateKey]' is undefined, it copies 'currentAllocations' (line 505 fallback).
+
+                    if (!prev[currentDate]) {
+                        newList = JSON.parse(JSON.stringify(currentAllocations));
+                    }
+
+                    // Add the new trip
+                    newList.push({
+                        vehicleId: vehicleId,
+                        tripNumber: nextTrip,
+                        assignedUsers: [],
+                        assignedUsersDropoff: [],
+                        pickupDriverId: '',
+                        pickupAssistantId: '',
+                        dropoffDriverId: '',
+                        dropoffAssistantId: '',
+                        driverId: '',
+                        assistantId: ''
+                    });
+
+                    return { ...prev, [currentDate]: newList };
+                });
+            };
+
+            const deleteTrip = (vehicleId, tripNumber) => {
+                if (!confirm(`${tripNumber}便を削除しますか？`)) return;
+                setAllocationHistory(prev => {
+                    // We need to ensure we have a list to filter from
+                    let baseList = prev[currentDate];
+                    if (!baseList) baseList = currentAllocations; // Fallback if history empty but view exists
+
+                    const newList = baseList.filter(a => !(a.vehicleId === vehicleId && (a.tripNumber || 1) === tripNumber));
+                    return { ...prev, [currentDate]: newList };
+                });
+            };
+
+            const removeTrip = (vehicleId, tripNumber) => {
+                if (!confirm(`${tripNumber}便を削除しますか？\n割り当てられた利用者は未割当に戻ります。`)) return;
+                setAllocationHistory(prev => {
+                    const currentList = currentAllocations;
+                    const newList = currentList.filter(a => !(a.vehicleId === vehicleId && (a.tripNumber || 1) === tripNumber));
+                    return { ...prev, [currentDate]: newList };
+                });
+            };
+
+            const updateVehicleStaff = (vehicleId, field, value, tripNumber = 1) => {
+                setAllocationHistory(prev => {
+                    const currentList = prev[currentDate] || currentAllocations;
+                    const newList = JSON.parse(JSON.stringify(currentList));
+                    const alloc = newList.find(a => a.vehicleId === vehicleId && (a.tripNumber || 1) === tripNumber);
+
+                    if (alloc) {
+                        alloc[field] = value;
+                    } else {
+                        // If alloc doesn't exist (e.g. Trip 2 not created yet?), we shouldn't be calling this.
+                        // UI won't show selectors if alloc doesn't exist.
+                    }
+
+                    return { ...prev, [currentDate]: newList };
+                });
+            };
+
+            const addStaff = () => {
+                if (!newStaffName.trim()) return;
+                const newId = 's' + new Date().getTime();
+                setStaff(prev => [...prev, { id: newId, name: newStaffName.trim() }]);
+                setNewStaffName("");
+            };
+
+            const deleteStaff = (id) => {
+                if (confirm('このスタッフを削除しますか？')) {
+                    setStaff(prev => prev.filter(s => s.id !== id));
+                }
+            };
+
+            // 印刷ハンドラ
+            const handlePrint = () => {
+                window.print();
+            };
+
+            const [vehicleFilter, setVehicleFilter] = useState('all');
+            // Record Input Tab State
+            const [recordVehicleId, setRecordVehicleId] = useState(null);
+            const [recordTripNumber, setRecordTripNumber] = useState(1);
+            const [recordType, setRecordType] = useState('assignedUsers'); // 'assignedUsers' (Pickup) or 'assignedUsersDropoff' (Dropoff)
+
+            // Add new vehicle handlers
+            const [newVehicleName, setNewVehicleName] = useState("");
+            const [newVehicleCapacity, setNewVehicleCapacity] = useState(4);
+
+            const addVehicle = () => {
+                if (!newVehicleName.trim()) return;
+                const newId = 'v' + new Date().getTime();
+                setVehicles(prev => [...prev, { id: newId, name: newVehicleName.trim(), capacity: Number(newVehicleCapacity) }]);
+                setNewVehicleName("");
+                setNewVehicleCapacity(4);
+            };
+
+            const deleteVehicle = (id) => {
+                if (confirm('この車両を削除しますか？\n(過去の配車データには影響しませんが、今後の表示から消えます)')) {
+                    setVehicles(prev => prev.filter(v => v.id !== id));
+                }
+            };
+
+            // Filtered allocations for display
+            const [activeTarget, setActiveTarget] = useState(null); // { vehicleId, tripNumber, type: 'assignedUsers'|'assignedUsersDropoff' }
+
+            const displayedAllocations = useMemo(() => {
+                let allocs = currentAllocations;
+                if (vehicleFilter !== 'all') {
+                    return allocs.filter(a => a.vehicleId === vehicleFilter);
+                }
+                return allocs;
+            }, [currentAllocations, vehicleFilter]);
+
+            const updateUserStatus = (vehicleId, userId, changes, targetDate, tripNumber = 1) => {
+                // Default to currentDate if not provided (for safety, though we'll pass it explicitly)
+                const dateKey = targetDate || currentDate;
+
+                setAllocationHistory(prev => {
+                    let baseList = prev[dateKey];
+                    if (!baseList) {
+                        // Fallback:
+                        if (dateKey === todayDateString) baseList = todayAllocations;
+                        else if (dateKey === currentDate) baseList = currentAllocations;
+                        else baseList = [];
+                    }
+
+                    const newList = JSON.parse(JSON.stringify(baseList));
+
+                    const alloc = newList.find(a => a.vehicleId === vehicleId && (a.tripNumber || 1) === tripNumber);
+                    if (alloc) {
+                        const userEntry = alloc.assignedUsers.find(au => au.userId === userId);
+                        if (userEntry) {
+                            // Merge changes (temperature, remarks)
+                            Object.assign(userEntry, changes);
+                        }
+                    }
+
+                    return { ...prev, [dateKey]: newList };
+                });
+            };
+
+            const updateAllocationStatus = (vehicleId, changes, targetDate, tripNumber = 1) => {
+                const dateKey = targetDate || currentDate;
+                setAllocationHistory(prev => {
+                    let baseList = prev[dateKey];
+                    if (!baseList) {
+                        if (dateKey === todayDateString) baseList = todayAllocations;
+                        else if (dateKey === currentDate) baseList = currentAllocations;
+                        else baseList = [];
+                    }
+                    const newList = JSON.parse(JSON.stringify(baseList));
+                    const alloc = newList.find(a => a.vehicleId === vehicleId && (a.tripNumber || 1) === tripNumber);
+                    if (alloc) {
+                        Object.assign(alloc, changes);
+                    }
+                    return { ...prev, [dateKey]: newList };
+                });
+            };
+
+            const updateUserMaster = (userId, updates) => {
+                setUsers(prev => prev.map(u => u.id === userId ? { ...u, ...updates } : u));
+            };
+
+            return (
+                <div className="min-h-screen pb-20 print:pb-0 print:bg-white">
+                    {/* ヘッダー */}
+                    <header className="bg-indigo-600 text-white p-4 sticky top-0 z-50 shadow-md print:hidden">
+                        <div className="flex justify-between items-center max-w-5xl mx-auto">
+                            <h1 className="text-lg font-bold">送迎配車管理</h1>
+                            <div className="flex items-center gap-2">
+                                <span className={`text-[10px] px-2 py-0.5 rounded ${statusMessage.includes('エラー') ? 'bg-red-500' : 'bg-indigo-500'}`}>{statusMessage || '待機中'}</span>
+                                <button onClick={() => syncCloud('save')} disabled={isSyncing} className="bg-white text-indigo-600 px-3 py-1 rounded text-xs font-bold hover:bg-indigo-50 disabled:opacity-50">
+                                    {isSyncing ? '通信中...' : 'クラウド同期'}
+                                </button>
+                            </div>
+                        </div>
+                    </header>
+
+                    {/* タブナビゲーション */}
+                    <div className="flex justify-center bg-white border-b sticky top-14 z-40 print:hidden overflow-x-auto">
+                        {[
+                            { id: 'schedule', label: '配車作成' },
+                            { id: 'record', label: '実績入力' },
+                            { id: 'history', label: '実績履歴' },
+                            { id: 'users', label: '利用者設定' },
+                            { id: 'staff', label: 'スタッフ設定' },
+                            { id: 'vehicles', label: '車両設定' },
+                            { id: 'sync', label: 'データ連携' }
+                        ].map(tab => (
+                            <button key={tab.id} onClick={() => setActiveTab(tab.id)} className={`py-3 px-4 text-sm font-bold border-b-2 transition-all whitespace-nowrap ${activeTab === tab.id ? 'border-indigo-600 text-indigo-600' : 'border-transparent text-slate-400'}`}>{tab.label}</button>
+                        ))}
+                    </div>
+
+                    {/* 印刷用ヘッダー（画面上は非表示） */}
+                    <div className="hidden print:block p-4 border-b mb-4">
+                        <h1 className="text-2xl font-black text-slate-900">送迎配車表 - {activeTab === 'schedule' ? `${currentDate} (${currentDayOfWeek})` : ''}</h1>
+                        <p className="text-sm text-slate-500 text-right">作成日: {new Date().toLocaleDateString()}</p>
+                    </div>
+
+                    <main className="p-4 print:p-0">
+                        {activeTab === 'schedule' && (
+                            <div className="space-y-6 print:space-y-4">
+                                {/* ... navigation & search (kept as is) ... */}
+                                <div className="flex items-center justify-between print:hidden">
+                                    <div className="flex items-center gap-2">
+                                        <button
+                                            onClick={() => {
+                                                const d = new Date(currentDate);
+                                                d.setDate(d.getDate() - 1);
+                                                setCurrentDate(d.toISOString().split('T')[0]);
+                                            }}
+                                            className="bg-white border rounded-lg p-2 hover:bg-slate-50"
+                                        >
+                                            ←
+                                        </button>
+                                        <input
+                                            type="date"
+                                            value={currentDate}
+                                            onChange={(e) => setCurrentDate(e.target.value)}
+                                            className="bg-white border text-lg font-bold rounded-lg px-4 py-2 outline-none focus:border-indigo-500 shadow-sm"
+                                        />
+                                        <button
+                                            onClick={() => {
+                                                const d = new Date(currentDate);
+                                                d.setDate(d.getDate() + 1);
+                                                setCurrentDate(d.toISOString().split('T')[0]);
+                                            }}
+                                            className="bg-white border rounded-lg p-2 hover:bg-slate-50"
+                                        >
+                                            →
+                                        </button>
+                                        <span className={`text-lg font-black ml-2 ${currentDayOfWeek === '日' ? 'text-red-500' : currentDayOfWeek === '土' ? 'text-blue-500' : 'text-slate-600'}`}>
+                                            ({currentDayOfWeek})
+                                        </span>
+                                    </div>
+
+                                    {/* 印刷ボタン */}
+                                    <button onClick={handlePrint} className="flex items-center gap-2 bg-slate-800 text-white py-2 px-4 rounded-lg text-xs font-bold hover:bg-slate-700 transition-all">
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" />
+                                        </svg>
+                                        印刷する
+                                    </button>
+                                </div>
+
+                                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 print:block">
+                                    {/* Unallocated user list (kept as is) - hidden if single vehicle view? Maybe not, dragging needed. */}
+                                    <div className={`md:col-span-1 space-y-3 print:hidden`}> {/* If single view on mobile, hide unallocated? */}
+                                        {/* ... (Search & Unallocated UI Code from previous step) ... */}
+                                        <div className="flex justify-between items-center">
+                                            <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest">
+                                                {showAllUsers ? "全利用者検索" : `本日の未割当 (${displayedUnallocatedUsers.length})`}
+                                            </h2>
+                                            <button
+                                                onClick={() => { setShowAllUsers(!showAllUsers); setSearchQuery(""); setSelectedKanaRow(null); }}
+                                                className={`text-[10px] px-2 py-1 rounded font-bold transition-all border ${showAllUsers ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-500 border-slate-200'}`}
+                                            >
+                                                {showAllUsers ? "予定のみ表示" : "全員から検索"}
+                                            </button>
+                                        </div>
+                                        {/* ... (Search inputs & list) ... */}
+                                        <div className="bg-white p-3 rounded-xl shadow-sm border border-slate-200 space-y-2">
+                                            <input
+                                                type="text"
+                                                value={searchQuery}
+                                                onChange={(e) => setSearchQuery(e.target.value)}
+                                                placeholder="名前で検索..."
+                                                className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-indigo-400"
+                                            />
+                                            <div className="flex flex-wrap gap-1">
+                                                {KANA_ROWS.map(row => (
+                                                    <button
+                                                        key={row.label}
+                                                        onClick={() => setSelectedKanaRow(selectedKanaRow === row.label ? null : row.label)}
+                                                        className={`flex-1 text-[10px] py-1 rounded border font-bold transition-all ${selectedKanaRow === row.label ? 'bg-indigo-500 text-white border-indigo-500' : 'bg-slate-50 text-slate-500 border-slate-200 hover:bg-slate-100'}`}
+                                                    >
+                                                        {row.label}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </div>
+
+                                        <div className="max-h-[500px] overflow-y-auto no-scrollbar space-y-2">
+                                            {displayedUnallocatedUsers.map(u => {
+                                                const isScheduled = u.schedule.includes(currentDayOfWeek);
+                                                return (
+                                                    <div key={u.id} className="bg-white p-3 rounded-xl shadow-sm border border-slate-200">
+                                                        <div className="flex justify-between items-start mb-2">
+                                                            <div className="text-sm font-bold">
+                                                                {u.name}
+                                                                {!isScheduled && <span className="ml-1 text-[8px] bg-yellow-100 text-yellow-700 px-1 rounded border border-yellow-200">予定外</span>}
+                                                            </div>
+                                                            <div className="text-[10px] text-slate-400">ID:{u.id}</div>
+                                                        </div>
+                                                        <div className="grid grid-cols-2 gap-1">
+                                                            {/* Show active targets only or all? User wants to "Select" target vehicle first. */}
+                                                            {/* Actually, previous UI had buttons for ALL vehicles. Now we need to know if we are selecting for Pickup or Dropoff. */}
+                                                            {/* Strategy:
+                                                                If 'activeTarget' is set, show "Add to [Vehicle] [Trip] [Pickup/Dropoff]" button.
+                                                                If NOT set, maybe show nothing or ask to select vehicle first?
+                                                                Original: List of all vehicles. 
+                                                                New: Too many buttons if we show Pickup AND Dropoff for All Vehicles.
+                                                                Design Change: "Select Target" mode.
+                                                                1. User clicks "Select" on Vehicle Card (Pickup or Dropoff section).
+                                                                2. Unallocated List highlights.
+                                                                3. Clicking User adds to that target.
+                                                            */}
+                                                            {activeTarget ? (
+                                                                <button
+                                                                    onClick={() => toggleAllocation(u.id, activeTarget.vehicleId, activeTarget.tripNumber, activeTarget.type)}
+                                                                    className={`col-span-2 text-xs py-2 rounded font-bold transition-all bg-indigo-600 text-white hover:bg-indigo-700`}
+                                                                >
+                                                                    {vehicles.find(v => v.id === activeTarget.vehicleId)?.name}
+                                                                    ({activeTarget.tripNumber}便)
+                                                                    {activeTarget.type === 'assignedUsers' ? '迎え' : '送り'} 追加
+                                                                </button>
+                                                            ) : (
+                                                                <div className="col-span-2 text-[10px] text-center text-slate-400 py-1 border border-dashed rounded bg-slate-50">
+                                                                    車両の「選択」ボタンを押してください
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })}
+                                            {displayedUnallocatedUsers.length === 0 && (
+                                                <div className="text-center text-xs text-slate-400 py-8">
+                                                    該当する利用者は見つかりませんでした
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                    {/* Vehicle Cards Area */}
+                                    <div className={`md:col-span-2 space-y-4 print:w-full`}> {/* If filtered, take full width if we hide Unallocated on mobile, but on desktop we share space. Actually user wants Single View to be BIG. */}
+                                        {/* Note: In 'vehicles' map below, we filter. */}
+                                        {currentAllocations.map(alloc => {
+                                            const vehicle = vehicles.find(v => v.id === alloc.vehicleId);
+                                            if (!vehicle) return null;
+                                            const occupancy = alloc.assignedUsers.length;
+                                            const isFull = occupancy >= vehicle.capacity;
+                                            const tripNum = alloc.tripNumber || 1;
+
+                                            return (
+                                                <div key={`${alloc.vehicleId}-${tripNum}`} className={`p-4 rounded-xl shadow-sm border transition-all break-inside-avoid print:break-inside-avoid print:border-slate-300 print:shadow-none bg-white border-slate-200 ${activeTarget?.vehicleId === alloc.vehicleId && activeTarget?.tripNumber === tripNum ? 'ring-2 ring-indigo-500' : ''}`}>
+                                                    <div className="flex justify-between items-start mb-4 border-b pb-2">
+                                                        <div>
+                                                            <div className="flex items-center gap-2">
+                                                                <h3 className={`font-black text-slate-800 text-lg`}>{vehicle.name} <span className="text-sm font-bold text-slate-500 rounded bg-slate-100 px-2 py-0.5 ml-1">{tripNum}便</span></h3>
+                                                                {tripNum === 1 && (
+                                                                    <button onClick={() => addTrip(alloc.vehicleId)} className="text-[10px] bg-indigo-50 text-indigo-600 px-2 py-1 rounded hover:bg-indigo-100 font-bold print:hidden">
+                                                                        + 便追加
+                                                                    </button>
+                                                                )}
+                                                                {tripNum > 1 && (
+                                                                    <button onClick={() => deleteTrip(alloc.vehicleId, tripNum)} className="text-[10px] bg-red-50 text-red-600 px-2 py-1 rounded hover:bg-red-100 font-bold print:hidden">
+                                                                        削除
+                                                                    </button>
+                                                                )}
+                                                            </div>
+                                                            <div className={`text-xs font-bold mt-1 ${isFull ? 'text-red-500' : 'text-slate-400'}`}>
+                                                                {occupancy} / {vehicle.capacity}名
+                                                            </div>
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="grid grid-cols-2 gap-4">
+                                                        <div className="space-y-2">
+                                                            <div className="flex flex-col gap-2 bg-slate-50 p-2 rounded-lg border border-slate-100">
+                                                                <div className="flex justify-between items-center">
+                                                                    <div className="font-bold text-sm text-slate-700">迎え</div>
+                                                                    <button
+                                                                        onClick={() => setActiveTarget({ vehicleId: alloc.vehicleId, tripNumber: tripNum, type: 'assignedUsers' })}
+                                                                        className={`flex-1 ml-4 py-2 px-2 rounded-lg font-bold text-xs transition-all shadow-sm flex items-center justify-center gap-1 print:hidden ${activeTarget?.vehicleId === alloc.vehicleId && activeTarget?.tripNumber === tripNum && activeTarget?.type === 'assignedUsers' ? 'bg-indigo-600 text-white ring-2 ring-indigo-300' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300'}`}
+                                                                    >
+                                                                        {activeTarget?.vehicleId === alloc.vehicleId && activeTarget?.tripNumber === tripNum && activeTarget?.type === 'assignedUsers' && (
+                                                                            <span>●</span>
+                                                                        )}
+                                                                        選択中はここに追加
+                                                                    </button>
+                                                                </div>
+
+                                                                <div className="flex gap-2 items-center print:hidden bg-white p-1.5 rounded border border-slate-200">
+                                                                    <div className="flex items-center gap-1">
+                                                                        <span className="text-[10px] font-bold text-slate-400 bg-slate-100 px-1 rounded">Dr</span>
+                                                                        <select
+                                                                            value={alloc.pickupDriverId || ""}
+                                                                            onChange={(e) => updateVehicleStaff(alloc.vehicleId, 'pickupDriverId', e.target.value, tripNum)}
+                                                                            className="text-[11px] bg-transparent font-bold text-slate-700 outline-none w-20 cursor-pointer hover:bg-slate-50 rounded"
+                                                                        >
+                                                                            <option value="">(未定)</option>
+                                                                            {staff.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                                                        </select>
+                                                                    </div>
+                                                                    <div className="w-px h-3 bg-slate-200"></div>
+                                                                    <div className="flex items-center gap-1">
+                                                                        <span className="text-[10px] font-bold text-slate-400 bg-slate-100 px-1 rounded">As</span>
+                                                                        <select
+                                                                            value={alloc.pickupAssistantId || ""}
+                                                                            onChange={(e) => updateVehicleStaff(alloc.vehicleId, 'pickupAssistantId', e.target.value, tripNum)}
+                                                                            className="text-[11px] bg-transparent font-bold text-slate-700 outline-none w-20 cursor-pointer hover:bg-slate-50 rounded"
+                                                                        >
+                                                                            <option value="">(未定)</option>
+                                                                            {staff.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                                                        </select>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+
+                                                            {/* Print View: Pickup Staff */}
+                                                            <div className="hidden print:flex gap-2 text-[10px] text-slate-500 mb-1 ml-1">
+                                                                <span>Dr:<span className="font-bold text-black ml-0.5">{staff.find(s => s.id === alloc.pickupDriverId)?.name || '___'}</span></span>
+                                                                <span>As:<span className="font-bold text-black ml-0.5">{staff.find(s => s.id === alloc.pickupAssistantId)?.name || '___'}</span></span>
+                                                            </div>
+                                                            {/* Pickup List */}
+                                                            <div className="space-y-1">
+                                                                {alloc.assignedUsers.map(au => {
+                                                                    const user = users.find(u => u.id === au.userId);
+                                                                    const isScheduled = user?.schedule.includes(currentDayOfWeek);
+                                                                    return (
+                                                                        <div key={`p-${au.userId}`} className={`flex justify-between items-center px-2 py-1.5 rounded border overflow-hidden transition-colors ${isScheduled ? 'bg-white border-slate-200' : 'bg-yellow-50 border-yellow-200'}`}>
+                                                                            <span className={`text-xs font-bold truncate ${!isScheduled ? 'text-yellow-700' : 'text-slate-700'}`}>
+                                                                                {user?.name}
+                                                                            </span>
+                                                                            <button onClick={() => toggleAllocation(au.userId, null, tripNum, 'assignedUsers')} className="text-slate-300 hover:text-red-500 font-bold px-1 print:hidden text-lg leading-none">×</button>
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                        </div>
+
+                                                        <div className="space-y-2">
+                                                            <div className="flex flex-col gap-2 bg-slate-50 p-2 rounded-lg border border-slate-100">
+                                                                <div className="flex justify-between items-center">
+                                                                    <div className="font-bold text-sm text-slate-700">送り</div>
+                                                                    <button
+                                                                        onClick={() => setActiveTarget({ vehicleId: alloc.vehicleId, tripNumber: tripNum, type: 'assignedUsersDropoff' })}
+                                                                        className={`flex-1 ml-4 py-2 px-2 rounded-lg font-bold text-xs transition-all shadow-sm flex items-center justify-center gap-1 print:hidden ${activeTarget?.vehicleId === alloc.vehicleId && activeTarget?.tripNumber === tripNum && activeTarget?.type === 'assignedUsersDropoff' ? 'bg-indigo-600 text-white ring-2 ring-indigo-300' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300'}`}
+                                                                    >
+                                                                        {activeTarget?.vehicleId === alloc.vehicleId && activeTarget?.tripNumber === tripNum && activeTarget?.type === 'assignedUsersDropoff' && (
+                                                                            <span>●</span>
+                                                                        )}
+                                                                        選択中はここに追加
+                                                                    </button>
+                                                                </div>
+
+                                                                <div className="flex gap-2 items-center print:hidden bg-white p-1.5 rounded border border-slate-200 relative group">
+                                                                    <div className="flex items-center gap-1">
+                                                                        <span className="text-[10px] font-bold text-slate-400 bg-slate-100 px-1 rounded">Dr</span>
+                                                                        <select
+                                                                            value={alloc.dropoffDriverId || ""}
+                                                                            onChange={(e) => updateVehicleStaff(alloc.vehicleId, 'dropoffDriverId', e.target.value, tripNum)}
+                                                                            className="text-[11px] bg-transparent font-bold text-slate-700 outline-none w-20 cursor-pointer hover:bg-slate-50 rounded"
+                                                                        >
+                                                                            <option value="">(未定)</option>
+                                                                            {staff.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                                                        </select>
+                                                                    </div>
+                                                                    <div className="w-px h-3 bg-slate-200"></div>
+                                                                    <div className="flex items-center gap-1">
+                                                                        <span className="text-[10px] font-bold text-slate-400 bg-slate-100 px-1 rounded">As</span>
+                                                                        <select
+                                                                            value={alloc.dropoffAssistantId || ""}
+                                                                            onChange={(e) => updateVehicleStaff(alloc.vehicleId, 'dropoffAssistantId', e.target.value, tripNum)}
+                                                                            className="text-[11px] bg-transparent font-bold text-slate-700 outline-none w-20 cursor-pointer hover:bg-slate-50 rounded"
+                                                                        >
+                                                                            <option value="">(未定)</option>
+                                                                            {staff.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                                                        </select>
+                                                                    </div>
+
+                                                                    <div className="absolute right-1 top-1/2 -translate-y-1/2">
+                                                                        <button
+                                                                            title="迎えをコピー"
+                                                                            onClick={() => {
+                                                                                if (confirm('迎えのリストを送りにコピーしますか？\n（現在の送りリストは上書きされます）')) {
+                                                                                    setAllocationHistory(prev => {
+                                                                                        const nList = JSON.parse(JSON.stringify(currentAllocations));
+                                                                                        const target = nList.find(a => a.vehicleId === alloc.vehicleId && (a.tripNumber || 1) === tripNum);
+                                                                                        if (target) {
+                                                                                            target.assignedUsersDropoff = JSON.parse(JSON.stringify(target.assignedUsers));
+                                                                                        }
+                                                                                        return { ...prev, [currentDate]: nList };
+                                                                                    });
+                                                                                }
+                                                                            }}
+                                                                            className="opacity-20 group-hover:opacity-100 transition-opacity p-1 rounded-full hover:bg-indigo-50 text-slate-400 hover:text-indigo-600"
+                                                                        >
+                                                                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                                                                            </svg>
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                            {/* Print View: Dropoff Staff */}
+                                                            <div className="hidden print:flex gap-2 text-[10px] text-slate-500 mb-1 ml-1">
+                                                                <span>Dr:<span className="font-bold text-black ml-0.5">{staff.find(s => s.id === alloc.dropoffDriverId)?.name || '___'}</span></span>
+                                                                <span>As:<span className="font-bold text-black ml-0.5">{staff.find(s => s.id === alloc.dropoffAssistantId)?.name || '___'}</span></span>
+                                                            </div>
+                                                            {/* Dropoff List */}
+                                                            <div className="space-y-1">
+                                                                {(alloc.assignedUsersDropoff || []).map(au => {
+                                                                    const user = users.find(u => u.id === au.userId);
+                                                                    const isScheduled = user?.schedule.includes(currentDayOfWeek);
+                                                                    return (
+                                                                        <div key={`d-${au.userId}`} className={`flex justify-between items-center px-2 py-1.5 rounded border overflow-hidden ${isScheduled ? 'bg-white border-slate-200' : 'bg-yellow-50 border-yellow-200'}`}>
+                                                                            <span className={`text-xs font-bold truncate ${!isScheduled ? 'text-yellow-700' : 'text-slate-700'}`}>
+                                                                                {user?.name}
+                                                                            </span>
+                                                                            <button onClick={() => toggleAllocation(au.userId, null, tripNum, 'assignedUsersDropoff')} className="text-slate-300 hover:text-red-500 font-bold px-1 print:hidden text-lg leading-none">×</button>
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {activeTab === 'record' && (
+                            <div className="max-w-4xl mx-auto space-y-4">
+                                {/* ヘッダー: 日付表示 */}
+                                <div className="bg-gradient-to-r from-indigo-600 to-indigo-500 text-white p-4 rounded-xl shadow-lg">
+                                    <div className="flex items-center justify-between">
+                                        <div className="flex items-center gap-3">
+                                            <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                            </svg>
+                                            <div>
+                                                <div className="text-2xl font-black">{todayDateString}</div>
+                                                <div className="text-sm opacity-80">実績入力</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* 車両選択グリッド - 大きなボタン (未割当車両は非表示) */}
+                                <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                                    {vehicles.filter(v => {
+                                        // 今日この車両に割り当てられた利用者がいるかチェック
+                                        const vehicleAllocs = todayAllocations.filter(a => a.vehicleId === v.id);
+                                        const hasUsers = vehicleAllocs.some(a =>
+                                            (a.assignedUsers && a.assignedUsers.length > 0) ||
+                                            (a.assignedUsersDropoff && a.assignedUsersDropoff.length > 0)
+                                        );
+                                        return hasUsers;
+                                    }).map(v => {
+                                        const isSelected = recordVehicleId === v.id;
+                                        const userCount = todayAllocations.filter(a => a.vehicleId === v.id)
+                                            .reduce((sum, a) => sum + (a.assignedUsers?.length || 0), 0);
+                                        return (
+                                            <button
+                                                key={v.id}
+                                                onClick={() => { setRecordVehicleId(v.id); setRecordTripNumber(1); }}
+                                                className={`p-4 rounded-xl font-bold text-left transition-all shadow-sm ${isSelected
+                                                    ? 'bg-indigo-600 text-white shadow-indigo-200 ring-4 ring-indigo-300'
+                                                    : 'bg-white border-2 border-slate-200 text-slate-700 hover:border-indigo-300 hover:bg-indigo-50'}`}
+                                            >
+                                                <div className="text-lg">{v.name}</div>
+                                                <div className={`text-xs mt-1 ${isSelected ? 'text-indigo-200' : 'text-slate-400'}`}>
+                                                    {userCount}名割当
+                                                </div>
+                                            </button>
+                                        );
+                                    })}
+                                    {vehicles.filter(v => {
+                                        const vehicleAllocs = todayAllocations.filter(a => a.vehicleId === v.id);
+                                        return vehicleAllocs.some(a =>
+                                            (a.assignedUsers && a.assignedUsers.length > 0) ||
+                                            (a.assignedUsersDropoff && a.assignedUsersDropoff.length > 0)
+                                        );
+                                    }).length === 0 && (
+                                            <div className="col-span-2 md:col-span-3 text-center py-8 text-slate-400">
+                                                利用者が割り当てられた車両がありません
+                                            </div>
+                                        )}
+                                </div>
+
+                                {recordVehicleId ? (
+                                    <div className="space-y-4">
+                                        {/* 便・迎え/送り選択 */}
+                                        <div className="bg-white rounded-xl shadow-sm border overflow-hidden">
+                                            <div className="flex">
+                                                {/* 便選択 */}
+                                                <div className="flex-1 border-r">
+                                                    <div className="text-xs font-bold text-slate-400 px-4 pt-3 pb-1">便</div>
+                                                    <div className="flex gap-2 px-4 pb-3">
+                                                        {(() => {
+                                                            const trips = todayAllocations.filter(a => a.vehicleId === recordVehicleId)
+                                                                .sort((a, b) => (a.tripNumber || 1) - (b.tripNumber || 1));
+                                                            return trips.map(t => {
+                                                                const tn = t.tripNumber || 1;
+                                                                return (
+                                                                    <button
+                                                                        key={tn}
+                                                                        onClick={() => setRecordTripNumber(tn)}
+                                                                        className={`flex-1 py-3 rounded-lg text-lg font-black transition-all ${recordTripNumber === tn
+                                                                            ? 'bg-indigo-600 text-white shadow-lg'
+                                                                            : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+                                                                    >
+                                                                        {tn}
+                                                                    </button>
+                                                                );
+                                                            });
+                                                        })()}
+                                                    </div>
+                                                </div>
+                                                {/* 迎え/送り選択 */}
+                                                <div className="flex-1">
+                                                    <div className="text-xs font-bold text-slate-400 px-4 pt-3 pb-1">種別</div>
+                                                    <div className="flex gap-2 px-4 pb-3">
+                                                        <button
+                                                            onClick={() => setRecordType('assignedUsers')}
+                                                            className={`flex-1 py-3 rounded-lg text-lg font-black transition-all ${recordType === 'assignedUsers'
+                                                                ? 'bg-teal-500 text-white shadow-lg'
+                                                                : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+                                                        >
+                                                            迎え
+                                                        </button>
+                                                        <button
+                                                            onClick={() => setRecordType('assignedUsersDropoff')}
+                                                            className={`flex-1 py-3 rounded-lg text-lg font-black transition-all ${recordType === 'assignedUsersDropoff'
+                                                                ? 'bg-orange-500 text-white shadow-lg'
+                                                                : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+                                                        >
+                                                            送り
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* 運転手・添乗員情報 - 編集可能 */}
+                                        {(() => {
+                                            const alloc = todayAllocations.find(a => a.vehicleId === recordVehicleId && (a.tripNumber || 1) === recordTripNumber);
+                                            const startKey = recordType === 'assignedUsers' ? 'pickupStartTime' : 'dropoffStartTime';
+                                            const endKey = recordType === 'assignedUsers' ? 'pickupEndTime' : 'dropoffEndTime';
+                                            const driverKey = recordType === 'assignedUsers' ? 'pickupDriverId' : 'dropoffDriverId';
+                                            const assistantKey = recordType === 'assignedUsers' ? 'pickupAssistantId' : 'dropoffAssistantId';
+                                            const drId = alloc?.[driverKey] || '';
+                                            const asId = alloc?.[assistantKey] || '';
+
+                                            return (
+                                                <div className={`bg-gradient-to-r ${recordType === 'assignedUsers' ? 'from-teal-500 to-teal-400' : 'from-orange-500 to-orange-400'} text-white p-4 rounded-xl shadow-lg`}>
+                                                    <div className="flex items-center justify-between mb-3">
+                                                        <div className="text-2xl font-black">
+                                                            {recordType === 'assignedUsers' ? '迎え' : '送り'}
+                                                        </div>
+                                                        {/* 時間入力欄 - 黄色で目立たせる */}
+                                                        <div className="flex items-center gap-2 bg-yellow-400 rounded-lg px-3 py-2 shadow-lg">
+                                                            <input
+                                                                type="time"
+                                                                value={alloc?.[startKey] || ''}
+                                                                onChange={(e) => updateAllocationStatus(recordVehicleId, { [startKey]: e.target.value }, todayDateString, recordTripNumber)}
+                                                                className="bg-transparent text-yellow-900 text-lg font-black w-24 text-center outline-none"
+                                                            />
+                                                            <span className="text-yellow-700 font-bold">～</span>
+                                                            <input
+                                                                type="time"
+                                                                value={alloc?.[endKey] || ''}
+                                                                onChange={(e) => updateAllocationStatus(recordVehicleId, { [endKey]: e.target.value }, todayDateString, recordTripNumber)}
+                                                                className="bg-transparent text-yellow-900 text-lg font-black w-24 text-center outline-none"
+                                                            />
+                                                        </div>
+                                                    </div>
+                                                    {/* 運転手・添乗員 - 編集可能なセレクトボックス */}
+                                                    <div className="grid grid-cols-2 gap-3">
+                                                        <div className="bg-white/20 rounded-lg p-3">
+                                                            <div className="text-xs opacity-80 mb-1">運転手</div>
+                                                            <select
+                                                                value={drId}
+                                                                onChange={(e) => updateAllocationStatus(recordVehicleId, { [driverKey]: e.target.value }, todayDateString, recordTripNumber)}
+                                                                className="w-full bg-white text-slate-800 text-lg font-black rounded-lg px-3 py-2 outline-none cursor-pointer"
+                                                            >
+                                                                <option value="">未定</option>
+                                                                {staff.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                                            </select>
+                                                        </div>
+                                                        <div className="bg-white/20 rounded-lg p-3">
+                                                            <div className="text-xs opacity-80 mb-1">添乗員</div>
+                                                            <select
+                                                                value={asId}
+                                                                onChange={(e) => updateAllocationStatus(recordVehicleId, { [assistantKey]: e.target.value }, todayDateString, recordTripNumber)}
+                                                                className="w-full bg-white text-slate-800 text-lg font-black rounded-lg px-3 py-2 outline-none cursor-pointer"
+                                                            >
+                                                                <option value="">未定</option>
+                                                                {staff.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                                            </select>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })()}
+
+                                        {/* 利用者リスト - カードスタイル */}
+                                        <div className="space-y-3">
+                                            {(() => {
+                                                const alloc = todayAllocations.find(a => a.vehicleId === recordVehicleId && (a.tripNumber || 1) === recordTripNumber);
+                                                const targetList = alloc ? (alloc[recordType] || []) : [];
+
+                                                if (!targetList || targetList.length === 0) {
+                                                    return (
+                                                        <div className="bg-white rounded-xl shadow-sm border p-8 text-center">
+                                                            <div className="text-slate-400 font-bold">利用者が割り当てられていません</div>
+                                                            <div className="text-sm text-slate-300 mt-1">配車作成タブで割り当てを行ってください</div>
+                                                        </div>
+                                                    );
+                                                }
+
+                                                return targetList.map(au => {
+                                                    const u = users.find(user => user.id === au.userId);
+                                                    return (
+                                                        <div key={au.userId} className="bg-white rounded-xl shadow-sm border p-4">
+                                                            <div className="flex items-center justify-between mb-3">
+                                                                <div className="text-xl font-black text-slate-800">{u?.name}</div>
+                                                                <div className="flex items-center gap-2">
+                                                                    <span className="text-sm text-slate-400">体温</span>
+                                                                    <div className="flex items-center bg-slate-100 rounded-lg overflow-hidden border-2 border-slate-200 focus-within:border-indigo-500">
+                                                                        <input
+                                                                            type="number"
+                                                                            step="0.1"
+                                                                            inputMode="decimal"
+                                                                            placeholder="--.-"
+                                                                            value={au.temperature || ''}
+                                                                            onChange={(e) => updateUserStatus(recordVehicleId, au.userId, { temperature: e.target.value }, todayDateString, recordTripNumber, recordType)}
+                                                                            className="w-20 bg-transparent px-3 py-3 text-2xl font-black text-slate-700 outline-none text-center"
+                                                                        />
+                                                                        <span className="pr-3 text-lg font-bold text-slate-400">℃</span>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                            {u?.remarks && (
+                                                                <div className="bg-yellow-50 border border-yellow-200 rounded-lg px-3 py-2 text-sm text-yellow-700">
+                                                                    ⚠️ {u.remarks}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    );
+                                                });
+                                            })()}
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <div className="bg-white rounded-xl shadow-sm border p-12 text-center">
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 mx-auto text-slate-300 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 14v3m4-3v3m4-3v3M3 21h18M3 10h18M3 7l9-4 9 4M4 10h16v11H4V10z" />
+                                        </svg>
+                                        <p className="text-slate-400 font-bold text-lg">上のボタンから車両を選択してください</p>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {activeTab === 'users' && (
+                            <div className="max-w-4xl mx-auto space-y-6">
+                                <div className="bg-white p-6 rounded-xl shadow-sm border space-y-4">
+                                    <h2 className="text-lg font-bold">利用者設定</h2>
+                                    <div className="text-sm text-slate-500 mb-4">
+                                        ※ここでの変更はすべての配車データに反映されます。<br />
+                                        ※備考欄は「実績入力」画面にも表示・同期されます。
+                                    </div>
+
+                                    {/* Add User via simple form? Maybe later. Focused on list for now. */}
+                                    <div className="space-y-2">
+                                        <div className="bg-slate-100 p-3 rounded-lg font-bold text-xs text-slate-500 flex gap-4">
+                                            <div className="w-16">ID</div>
+                                            <div className="w-40">氏名</div>
+                                            <div className="flex-1">備考 (マスタ情報)</div>
+                                            <div className="w-16 text-center">操作</div>
+                                        </div>
+                                        <div className="space-y-2 max-h-[600px] overflow-y-auto">
+                                            {users.map(u => (
+                                                <div key={u.id} className="flex items-center gap-4 p-3 bg-white border rounded-lg shadow-sm hover:shadow-md transition-all">
+                                                    <div className="w-16 text-xs text-slate-400 font-mono">{u.id}</div>
+                                                    <div className="w-40">
+                                                        <input
+                                                            type="text"
+                                                            value={u.name}
+                                                            onChange={(e) => updateUserMaster(u.id, { name: e.target.value })}
+                                                            className="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1 text-sm font-bold"
+                                                        />
+                                                    </div>
+                                                    <div className="flex-1">
+                                                        <textarea
+                                                            value={u.name === 'admin' ? '' : (u.remarks || '')}
+                                                            placeholder={u.name === 'admin' ? '管理者アカウントのため編集不可' : '備考を入力...'}
+                                                            disabled={u.name === 'admin'}
+                                                            onChange={(e) => updateUserMaster(u.id, { remarks: e.target.value })}
+                                                            className="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1 text-sm h-16 resize-y outline-none"
+                                                        />
+                                                    </div>
+                                                    <div className="w-16 text-center">
+                                                        <button
+                                                            onClick={() => {
+                                                                if (confirm(`${u.name}さんを削除しますか？`)) {
+                                                                    setUsers(prev => prev.filter(user => user.id !== u.id));
+                                                                }
+                                                            }}
+                                                            className="text-red-400 hover:text-red-600 text-xs font-bold bg-white border border-red-100 px-2 py-1 rounded"
+                                                        >
+                                                            削除
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                            {users.length === 0 && <div className="text-center py-10 text-slate-400">利用者が登録されていません</div>}
+                                        </div>
+                                    </div>
+                                    <div className="pt-4 border-t">
+                                        <p className="text-xs text-slate-400 text-right">新規追加はCSVインポートまたはスプレッドシート連携をご利用ください</p>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {activeTab === 'staff' && (
+                            <div className="max-w-2xl mx-auto space-y-6">
+                                <div className="bg-white p-6 rounded-xl shadow-sm border space-y-4">
+                                    <h2 className="text-lg font-bold">スタッフ登録</h2>
+                                    <div className="flex gap-2">
+                                        <input
+                                            type="text"
+                                            value={newStaffName}
+                                            onChange={(e) => setNewStaffName(e.target.value)}
+                                            placeholder="スタッフ名 (例: 佐藤、田中...)"
+                                            className="flex-1 bg-slate-50 border rounded px-3 py-2"
+                                        />
+                                        <button onClick={addStaff} className="bg-indigo-600 text-white font-bold py-2 px-6 rounded hover:bg-indigo-700">追加</button>
+                                    </div>
+                                    <div className="space-y-2">
+                                        {staff.map(s => (
+                                            <div key={s.id} className="flex justify-between items-center p-3 bg-slate-50 rounded border">
+                                                <span className="font-bold">{s.name}</span>
+                                                <button onClick={() => deleteStaff(s.id)} className="text-red-400 hover:text-red-600 text-xs font-bold">削除</button>
+                                            </div>
+                                        ))}
+                                        {staff.length === 0 && <p className="text-slate-400 text-sm text-center">登録されたスタッフはいません</p>}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {activeTab === 'vehicles' && (
+                            <div className="max-w-2xl mx-auto space-y-6">
+                                <div className="bg-white p-6 rounded-xl shadow-sm border space-y-4">
+                                    <h2 className="text-lg font-bold">車両設定</h2>
+                                    <div className="flex gap-2 items-end">
+                                        <div className="flex-1">
+                                            <label className="text-xs font-bold text-slate-500">車両名</label>
+                                            <input
+                                                type="text"
+                                                value={newVehicleName}
+                                                onChange={(e) => setNewVehicleName(e.target.value)}
+                                                placeholder="例: ハイエース1号"
+                                                className="w-full bg-slate-50 border rounded px-3 py-2"
+                                            />
+                                        </div>
+                                        <div className="w-24">
+                                            <label className="text-xs font-bold text-slate-500">定員</label>
+                                            <input
+                                                type="number"
+                                                value={newVehicleCapacity}
+                                                onChange={(e) => setNewVehicleCapacity(e.target.value)}
+                                                className="w-full bg-slate-50 border rounded px-3 py-2"
+                                            />
+                                        </div>
+                                        <button onClick={addVehicle} className="bg-indigo-600 text-white font-bold py-2 px-6 rounded hover:bg-indigo-700 h-[42px]">追加</button>
+                                    </div>
+                                    <div className="space-y-2">
+                                        {vehicles.map(v => (
+                                            <div key={v.id} className="flex justify-between items-center p-4 bg-slate-50 rounded border">
+                                                <div>
+                                                    <div className="font-bold text-lg">{v.name}</div>
+                                                    <div className="text-xs text-slate-500">定員: {v.capacity}名</div>
+                                                </div>
+                                                <button onClick={() => deleteVehicle(v.id)} className="text-red-400 hover:text-red-600 text-xs font-bold">削除</button>
+                                            </div>
+                                        ))}
+                                        {vehicles.length === 0 && <p className="text-slate-400 text-sm text-center">登録された車両はいません</p>}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {activeTab === 'history' && (
+                            <div className="max-w-4xl mx-auto space-y-6">
+                                <div className="bg-white p-4 rounded-xl shadow-sm border flex flex-col md:flex-row justify-between items-center gap-4">
+                                    <div className="flex items-center gap-2">
+                                        <button onClick={() => { const d = new Date(currentDate); d.setDate(d.getDate() - 1); setCurrentDate(d.toISOString().split('T')[0]); }} className="bg-slate-100 border rounded-lg p-2 hover:bg-slate-200">←</button>
+                                        <input type="date" value={currentDate} onChange={(e) => setCurrentDate(e.target.value)} className="bg-white border text-lg font-bold rounded-lg px-4 py-2 outline-none focus:border-indigo-500 shadow-sm" />
+                                        <button onClick={() => { const d = new Date(currentDate); d.setDate(d.getDate() + 1); setCurrentDate(d.toISOString().split('T')[0]); }} className="bg-slate-100 border rounded-lg p-2 hover:bg-slate-200">→</button>
+                                        <span className={`text-lg font-black ml-2 ${currentDayOfWeek === '日' ? 'text-red-500' : currentDayOfWeek === '土' ? 'text-blue-500' : 'text-slate-600'}`}>({currentDayOfWeek})</span>
+                                    </div>
+                                    <div className="text-sm text-slate-500">
+                                        {allocationHistory[currentDate] ? `${currentAllocations.reduce((sum, a) => sum + (a.assignedUsers?.length || 0), 0)}名の実績あり` : '実績データなし'}
+                                    </div>
+                                </div>
+
+                                {currentAllocations.length > 0 ? (
+                                    <div className="space-y-4">
+                                        {currentAllocations.map(alloc => {
+                                            const vehicle = vehicles.find(v => v.id === alloc.vehicleId);
+                                            if (!vehicle) return null;
+                                            const tripNum = alloc.tripNumber || 1;
+                                            const pickupDr = staff.find(s => s.id === alloc.pickupDriverId)?.name || '-';
+                                            const pickupAs = staff.find(s => s.id === alloc.pickupAssistantId)?.name || '-';
+                                            const dropoffDr = staff.find(s => s.id === alloc.dropoffDriverId)?.name || '-';
+                                            const dropoffAs = staff.find(s => s.id === alloc.dropoffAssistantId)?.name || '-';
+
+                                            return (
+                                                <div key={`${alloc.vehicleId}-${tripNum}`} className="bg-white rounded-xl shadow-sm border overflow-hidden">
+                                                    <div className="bg-slate-50 border-b p-4 flex justify-between items-center">
+                                                        <h3 className="font-black text-lg text-slate-800">{vehicle.name} <span className="text-sm font-bold text-slate-500 bg-slate-100 px-2 py-0.5 rounded ml-1">{tripNum}便</span></h3>
+                                                        <div className="text-xs text-slate-400">{(alloc.assignedUsers?.length || 0) + (alloc.assignedUsersDropoff?.length || 0)}名</div>
+                                                    </div>
+                                                    <div className="grid md:grid-cols-2 divide-y md:divide-y-0 md:divide-x">
+                                                        <div className="p-4">
+                                                            <div className="flex items-center justify-between mb-3">
+                                                                <span className="font-bold text-teal-600">迎え</span>
+                                                                <span className="text-xs text-slate-500">{alloc.pickupStartTime || '--:--'} ～ {alloc.pickupEndTime || '--:--'}</span>
+                                                            </div>
+                                                            <div className="text-xs text-slate-500 mb-2">Dr: {pickupDr} / As: {pickupAs}</div>
+                                                            <div className="space-y-1">
+                                                                {(alloc.assignedUsers || []).map(au => {
+                                                                    const user = users.find(u => u.id === au.userId);
+                                                                    return (
+                                                                        <div key={au.userId} className="flex justify-between items-center px-3 py-2 bg-slate-50 rounded border">
+                                                                            <span className="font-bold text-sm">{user?.name}</span>
+                                                                            <span className="text-xs text-slate-500">{au.temperature ? `${au.temperature}℃` : '-'}</span>
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                                {(!alloc.assignedUsers || alloc.assignedUsers.length === 0) && <div className="text-xs text-slate-400 py-2 text-center">利用者なし</div>}
+                                                            </div>
+                                                        </div>
+                                                        <div className="p-4">
+                                                            <div className="flex items-center justify-between mb-3">
+                                                                <span className="font-bold text-orange-600">送り</span>
+                                                                <span className="text-xs text-slate-500">{alloc.dropoffStartTime || '--:--'} ～ {alloc.dropoffEndTime || '--:--'}</span>
+                                                            </div>
+                                                            <div className="text-xs text-slate-500 mb-2">Dr: {dropoffDr} / As: {dropoffAs}</div>
+                                                            <div className="space-y-1">
+                                                                {(alloc.assignedUsersDropoff || []).map(au => {
+                                                                    const user = users.find(u => u.id === au.userId);
+                                                                    return (
+                                                                        <div key={au.userId} className="flex justify-between items-center px-3 py-2 bg-slate-50 rounded border">
+                                                                            <span className="font-bold text-sm">{user?.name}</span>
+                                                                            <span className="text-xs text-slate-500">{au.temperature ? `${au.temperature}℃` : '-'}</span>
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                                {(!alloc.assignedUsersDropoff || alloc.assignedUsersDropoff.length === 0) && <div className="text-xs text-slate-400 py-2 text-center">利用者なし</div>}
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                ) : (
+                                    <div className="bg-white rounded-xl shadow-sm border p-12 text-center text-slate-400">
+                                        <p className="font-bold">この日の実績データはありません</p>
+                                        <p className="text-sm mt-2">「配車作成」で配車を登録し、「実績入力」で記録してください</p>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {activeTab === 'sync' && (
+                            <div className="max-w-xl mx-auto space-y-4">
+                                <div className="bg-white p-6 rounded-xl shadow-sm border text-center space-y-4">
+                                    <h2 className="text-lg font-bold">クラウド連携 (Google Sheets)</h2>
+                                    <p className="text-sm text-slate-500">
+                                        すべてのデータ（利用者、配車設定、スタッフ、履歴）を<br />Googleスプレッドシートに保存・読み込みします。
+                                    </p>
+                                    <div className="flex justify-center gap-4">
+                                        <button onClick={() => syncCloud('save')} disabled={isSyncing} className="bg-indigo-600 text-white font-bold py-3 px-8 rounded-xl shadow-lg hover:bg-indigo-700 disabled:opacity-50 transition-all">
+                                            {isSyncing ? '通信中...' : 'クラウドへ保存'}
+                                        </button>
+                                        <button onClick={() => syncCloud('load')} disabled={isSyncing} className="bg-white text-indigo-600 border-2 border-indigo-600 font-bold py-3 px-8 rounded-xl hover:bg-indigo-50 disabled:opacity-50 transition-all">
+                                            {isSyncing ? '通信中...' : 'クラウドから読込'}
+                                        </button>
+                                    </div>
+                                    <p className="text-xs text-red-400 font-bold">{statusMessage}</p>
+                                </div>
+
+                                <div className="bg-white p-6 rounded-xl shadow-sm border space-y-4">
+                                    <h2 className="text-lg font-bold text-slate-700">CSV/TSV インポート (Legacy)</h2>
+                                    <textarea
+                                        value={csvInput}
+                                        onChange={(e) => setCsvInput(e.target.value)}
+                                        placeholder="スプレッドシートからコピーしたデータを貼り付けてください&#10;形式: ID, 名前, (月), (火)..."
+                                        className="w-full h-32 bg-slate-50 border rounded-lg p-3 text-sm font-mono"
+                                    ></textarea>
+                                    <button onClick={importData} className="w-full bg-slate-700 text-white font-bold py-3 rounded-lg hover:bg-slate-600">
+                                        データ取り込み
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </main>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+
+</html>
