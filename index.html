@@ -122,7 +122,9 @@ daysite
             const [users, setUsers] = useState([]);
             const [vehicles, setVehicles] = useState(INITIAL_VEHICLES);
             const [staff, setStaff] = useState([]);
+
             const [newStaffName, setNewStaffName] = useState("");
+            const [newUserName, setNewUserName] = useState(""); // User Addition State
 
             // History: { "2025-01-01": [ { vehicleId:..., assignedUsers:..., driverId:..., assistantId:... } ] }
             const [allocationHistory, setAllocationHistory] = useState({});
@@ -631,6 +633,13 @@ daysite
                 }
             };
 
+            const addUser = () => {
+                if (!newUserName.trim()) return;
+                const newId = 'u' + new Date().getTime();
+                setUsers(prev => [...prev, { id: newId, name: newUserName.trim(), schedule: [], remarks: '' }]);
+                setNewUserName("");
+            };
+
             // Filtered allocations for display
             const [activeTarget, setActiveTarget] = useState(null); // { vehicleId, tripNumber, type: 'assignedUsers'|'assignedUsersDropoff' }
 
@@ -944,8 +953,8 @@ daysite
 
                                                             {/* Print View: Pickup Staff */}
                                                             <div className="hidden print:flex gap-2 text-[10px] text-slate-500 mb-1 ml-1">
-                                                                <span>Dr:<span className="font-bold text-black ml-0.5">{staff.find(s => s.id === alloc.pickupDriverId)?.name || '___'}</span></span>
-                                                                <span>As:<span className="font-bold text-black ml-0.5">{staff.find(s => s.id === alloc.pickupAssistantId)?.name || '___'}</span></span>
+                                                                <span>Dr:<span className="font-bold text-black ml-0.5">{staff.find(s => s.id === alloc.pickupDriverId)?.name || (alloc.pickupDriverId ? `(ID:${alloc.pickupDriverId})` : '___')}</span></span>
+                                                                <span>As:<span className="font-bold text-black ml-0.5">{staff.find(s => s.id === alloc.pickupAssistantId)?.name || (alloc.pickupAssistantId ? `(ID:${alloc.pickupAssistantId})` : '___')}</span></span>
                                                             </div>
                                                             {/* Pickup List */}
                                                             <div className="space-y-1">
@@ -955,7 +964,7 @@ daysite
                                                                     return (
                                                                         <div key={`p-${au.userId}`} className={`flex justify-between items-center px-2 py-1.5 rounded border overflow-hidden transition-colors ${isScheduled ? 'bg-white border-slate-200' : 'bg-yellow-50 border-yellow-200'}`}>
                                                                             <span className={`text-xs font-bold truncate ${!isScheduled ? 'text-yellow-700' : 'text-slate-700'}`}>
-                                                                                {user?.name}
+                                                                                {user?.name || `未登録(ID:${au.userId})`}
                                                                             </span>
                                                                             <button onClick={() => toggleAllocation(au.userId, null, tripNum, 'assignedUsers')} className="text-slate-300 hover:text-red-500 font-bold px-1 print:hidden text-lg leading-none">×</button>
                                                                         </div>
@@ -1030,8 +1039,8 @@ daysite
                                                             </div>
                                                             {/* Print View: Dropoff Staff */}
                                                             <div className="hidden print:flex gap-2 text-[10px] text-slate-500 mb-1 ml-1">
-                                                                <span>Dr:<span className="font-bold text-black ml-0.5">{staff.find(s => s.id === alloc.dropoffDriverId)?.name || '___'}</span></span>
-                                                                <span>As:<span className="font-bold text-black ml-0.5">{staff.find(s => s.id === alloc.dropoffAssistantId)?.name || '___'}</span></span>
+                                                                <span>Dr:<span className="font-bold text-black ml-0.5">{staff.find(s => s.id === alloc.dropoffDriverId)?.name || (alloc.dropoffDriverId ? `(ID:${alloc.dropoffDriverId})` : '___')}</span></span>
+                                                                <span>As:<span className="font-bold text-black ml-0.5">{staff.find(s => s.id === alloc.dropoffAssistantId)?.name || (alloc.dropoffAssistantId ? `(ID:${alloc.dropoffAssistantId})` : '___')}</span></span>
                                                             </div>
                                                             {/* Dropoff List */}
                                                             <div className="space-y-1">
@@ -1041,7 +1050,7 @@ daysite
                                                                     return (
                                                                         <div key={`d-${au.userId}`} className={`flex justify-between items-center px-2 py-1.5 rounded border overflow-hidden ${isScheduled ? 'bg-white border-slate-200' : 'bg-yellow-50 border-yellow-200'}`}>
                                                                             <span className={`text-xs font-bold truncate ${!isScheduled ? 'text-yellow-700' : 'text-slate-700'}`}>
-                                                                                {user?.name}
+                                                                                {user?.name || `未登録(ID:${au.userId})`}
                                                                             </span>
                                                                             <button onClick={() => toggleAllocation(au.userId, null, tripNum, 'assignedUsersDropoff')} className="text-slate-300 hover:text-red-500 font-bold px-1 print:hidden text-lg leading-none">×</button>
                                                                         </div>
@@ -1253,7 +1262,7 @@ daysite
                                                     return (
                                                         <div key={au.userId} className="bg-white rounded-xl shadow-sm border p-4">
                                                             <div className="flex items-center justify-between mb-3">
-                                                                <div className="text-xl font-black text-slate-800">{u?.name}</div>
+                                                                <div className="text-xl font-black text-slate-800">{u?.name || `未登録(ID:${au.userId})`}</div>
                                                                 <div className="flex items-center gap-2">
                                                                     <span className="text-sm text-slate-400">体温</span>
                                                                     <div className="flex items-center bg-slate-100 rounded-lg overflow-hidden border-2 border-slate-200 focus-within:border-indigo-500">
@@ -1299,9 +1308,21 @@ daysite
                                     <div className="text-sm text-slate-500 mb-4">
                                         ※ここでの変更はすべての配車データに反映されます。<br />
                                         ※備考欄は「実績入力」画面にも表示・同期されます。
+                                        ※備考欄は「実績入力」画面にも表示・同期されます。
                                     </div>
 
-                                    {/* Add User via simple form? Maybe later. Focused on list for now. */}
+                                    {/* Manual User Entry Form */}
+                                    <div className="flex gap-2">
+                                        <input
+                                            type="text"
+                                            value={newUserName}
+                                            onChange={(e) => setNewUserName(e.target.value)}
+                                            placeholder="利用者名 (例: 山田 太郎)"
+                                            className="flex-1 bg-slate-50 border rounded px-3 py-2"
+                                        />
+                                        <button onClick={addUser} className="bg-indigo-600 text-white font-bold py-2 px-6 rounded hover:bg-indigo-700">追加</button>
+                                    </div>
+
                                     <div className="space-y-2">
                                         <div className="bg-slate-100 p-3 rounded-lg font-bold text-xs text-slate-500 flex gap-4">
                                             <div className="w-16">ID</div>
@@ -1348,7 +1369,9 @@ daysite
                                         </div>
                                     </div>
                                     <div className="pt-4 border-t">
-                                        <p className="text-xs text-slate-400 text-right">新規追加はCSVインポートまたはスプレッドシート連携をご利用ください</p>
+                                        <div className="pt-4 border-t">
+                                            <p className="text-xs text-slate-400 text-right">※ 大量登録にはCSVインポートも利用可能です（開発者用）</p>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
@@ -1440,13 +1463,13 @@ daysite
                                 {currentAllocations.length > 0 ? (
                                     <div className="space-y-4">
                                         {currentAllocations.map(alloc => {
-                                            const vehicle = vehicles.find(v => v.id === alloc.vehicleId);
-                                            if (!vehicle) return null;
+                                            const vehicle = vehicles.find(v => v.id === alloc.vehicleId) || { name: `未登録車両(ID:${alloc.vehicleId})`, capacity: 0 };
+                                            if (!vehicle) return null; // Should not happen with fallback
                                             const tripNum = alloc.tripNumber || 1;
-                                            const pickupDr = staff.find(s => s.id === alloc.pickupDriverId)?.name || '-';
-                                            const pickupAs = staff.find(s => s.id === alloc.pickupAssistantId)?.name || '-';
-                                            const dropoffDr = staff.find(s => s.id === alloc.dropoffDriverId)?.name || '-';
-                                            const dropoffAs = staff.find(s => s.id === alloc.dropoffAssistantId)?.name || '-';
+                                            const pickupDr = staff.find(s => s.id === alloc.pickupDriverId)?.name || (alloc.pickupDriverId ? `ID:${alloc.pickupDriverId}` : '-');
+                                            const pickupAs = staff.find(s => s.id === alloc.pickupAssistantId)?.name || (alloc.pickupAssistantId ? `ID:${alloc.pickupAssistantId}` : '-');
+                                            const dropoffDr = staff.find(s => s.id === alloc.dropoffDriverId)?.name || (alloc.dropoffDriverId ? `ID:${alloc.dropoffDriverId}` : '-');
+                                            const dropoffAs = staff.find(s => s.id === alloc.dropoffAssistantId)?.name || (alloc.dropoffAssistantId ? `ID:${alloc.dropoffAssistantId}` : '-');
 
                                             return (
                                                 <div key={`${alloc.vehicleId}-${tripNum}`} className="bg-white rounded-xl shadow-sm border overflow-hidden">
