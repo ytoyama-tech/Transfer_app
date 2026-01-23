@@ -41,7 +41,8 @@ self.addEventListener('fetch', (event) => {
                         caches.open(CACHE_NAME)
                             .then((cache) => {
                                 // Dynamically cache new requests (e.g. icons, or other external scripts)
-                                if (event.request.url.startsWith('http')) {
+                                // IMPORTANT: Do NOT cache Google Apps Script API calls
+                                if (event.request.url.startsWith('http') && !event.request.url.includes('script.google.com')) {
                                     cache.put(event.request, responseToCache);
                                 }
                             });
