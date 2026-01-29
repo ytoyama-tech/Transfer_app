@@ -444,18 +444,39 @@ daysite
             ];
 
             const displayedUnallocatedUsers = useMemo(() => {
-                // 1. Base List: All unallocated users OR All users (excluding currently assigned)
-                // Fix: Check assignment based on activeTarget type (Pickup vs Dropoff)
-                const targetType = activeTarget?.type || 'assignedUsers';
-                const allocatedIds = currentAllocations.flatMap(a => (a[targetType] || []).map(au => au.userId));
+                // 1. Analyze Allocations
+                const idsInPickup = new Set();
+                const idsInDropoff = new Set();
+
+                currentAllocations.forEach(a => {
+                    if (a.assignedUsers) a.assignedUsers.forEach(u => idsInPickup.add(u.userId));
+                    if (a.assignedUsersDropoff) a.assignedUsersDropoff.forEach(u => idsInDropoff.add(u.userId));
+                });
 
                 let candidates = [];
-                if (showAllUsers) {
-                    candidates = users.filter(u => !allocatedIds.includes(u.id));
-                } else {
-                    // Only today's scheduled users
-                    candidates = users.filter(u => u.schedule.includes(currentDayOfWeek) && !allocatedIds.includes(u.id));
-                }
+                const targetPool = showAllUsers ? users : users.filter(u => u.schedule.includes(currentDayOfWeek));
+
+                candidates = targetPool.filter(u => {
+                    // Check Global Allocation Status
+                    const inPickup = idsInPickup.has(u.id);
+                    const inDropoff = idsInDropoff.has(u.id);
+                    const isFullyAllocated = inPickup && inDropoff;
+
+                    if (isFullyAllocated) return false; // Hide if done both
+
+                    // Check Active Target Context (Prevent adding to self)
+                    if (activeTarget) {
+                        const targetAlloc = currentAllocations.find(a => a.vehicleId === activeTarget.vehicleId && (a.tripNumber || 1) === activeTarget.tripNumber);
+                        if (targetAlloc) {
+                            const listToCheck = activeTarget.type === 'assignedUsers' ? targetAlloc.assignedUsers : targetAlloc.assignedUsersDropoff;
+                            if (listToCheck && listToCheck.some(au => au.userId === u.id)) {
+                                return false; // Already in current target
+                            }
+                        }
+                    }
+
+                    return true;
+                });
 
                 // 2. Filter by Search Query
                 if (searchQuery.trim()) {
