@@ -445,7 +445,9 @@ daysite
 
             const displayedUnallocatedUsers = useMemo(() => {
                 // 1. Base List: All unallocated users OR All users (excluding currently assigned)
-                const allocatedIds = currentAllocations.flatMap(a => a.assignedUsers.map(au => au.userId));
+                // Fix: Check assignment based on activeTarget type (Pickup vs Dropoff)
+                const targetType = activeTarget?.type || 'assignedUsers';
+                const allocatedIds = currentAllocations.flatMap(a => (a[targetType] || []).map(au => au.userId));
 
                 let candidates = [];
                 if (showAllUsers) {
@@ -471,7 +473,7 @@ daysite
                 }
 
                 return candidates;
-            }, [users, currentAllocations, showAllUsers, searchQuery, selectedKanaRow, currentDayOfWeek]);
+            }, [users, currentAllocations, showAllUsers, searchQuery, selectedKanaRow, currentDayOfWeek, activeTarget]);
 
             const toggleAllocation = (userId, targetVehicleId, targetTripNumber = 1, targetType = 'assignedUsers') => {
                 setAllocationHistory(prev => {
